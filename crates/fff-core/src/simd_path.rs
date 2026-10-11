@@ -80,6 +80,7 @@ pub(crate) struct ChunkedString {
     pub byte_len: u16,
     /// Byte offset where the filename begins. 0 for root-level files.
     pub filename_offset: u16,
+    char_mask: u32,
 }
 
 impl ChunkedString {
@@ -88,6 +89,7 @@ impl ChunkedString {
             index_offset: 0,
             byte_len: 0,
             filename_offset: 0,
+            char_mask: 0,
         }
     }
 
@@ -97,7 +99,20 @@ impl ChunkedString {
             index_offset,
             byte_len,
             filename_offset,
+            char_mask: 0,
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn char_mask(&self) -> u32 {
+        self.char_mask
+    }
+
+    // Makes the character-class prefilter accept this path unconditionally.
+    #[cfg(test)]
+    pub(crate) fn without_char_mask(mut self) -> Self {
+        self.char_mask = u32::MAX;
+        self
     }
 
     #[inline]
@@ -422,9 +437,40 @@ impl ChunkedPathStoreBuilder {
             self.indices.push(arena_idx);
         }
 
-        ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset)
+        let mut string = ChunkedString::new(index_offset, path_bytes.len() as u16, filename_offset);
+        string.char_mask = char_class_mask(path_bytes);
+        string
     }
 }
+
+// Case-folded ASCII character classes present in `bytes`; non-ASCII bytes are ignored.
+#[inline]
+pub(crate) fn char_class_mask(bytes: &[u8]) -> u32 {
+    bytes
+        .iter()
+        .fold(0, |mask, &byte| mask | CHAR_CLASS_BITS[byte as usize])
+}
+
+const CHAR_CLASS_BITS: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut byte = 0;
+    while byte < 128 {
+        let c = byte as u8;
+        table[byte] = 1
+            << match c {
+                b'a'..=b'z' => c - b'a',
+                b'A'..=b'Z' => c - b'A',
+                b'0'..=b'4' => 26,
+                b'5'..=b'9' => 27,
+                b'_' => 28,
+                b'-' => 29,
+                b'.' => 30,
+                _ => 31,
+            };
+        byte += 1;
+    }
+    table
+};
 
 #[cfg(test)]
 pub(crate) fn build_chunked_path_store_from_strings(
@@ -498,6 +544,19 @@ mod tests {
             file.set_path(strings[i].clone());
         }
         (store, strings, files)
+    }
+
+    #[test]
+    fn char_class_mask_folds_case_and_ignores_non_ascii() {
+        assert_eq!(char_class_mask(b""), 0);
+        assert_eq!(char_class_mask(b"Ab"), char_class_mask(b"aB"));
+        assert_eq!(char_class_mask("é日".as_bytes()), 0);
+        assert_eq!(char_class_mask(b"a/"), 1 | 1 << 31);
+        assert_eq!(char_class_mask(b"09_-."), 0b1111_1 << 26);
+
+        let mut builder = ChunkedPathStoreBuilder::new(1);
+        let string = builder.add_file_immediate("src/Main_1.rs", 4);
+        assert_eq!(string.char_mask(), char_class_mask(b"src/Main_1.rs"));
     }
 
     #[test]

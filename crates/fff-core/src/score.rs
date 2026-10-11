@@ -3,7 +3,7 @@ use crate::{
     index::constraints::apply_constraints,
     match_offsets::char_indices_to_byte_offsets,
     path_utils::DirectoryDistance,
-    simd_path::{ArenaPtr, MAX_PATH_CHUNKS},
+    simd_path::{ArenaPtr, MAX_PATH_CHUNKS, char_class_mask},
     sort_buffer::sort_with_buffer,
     types::{DirItem, FileItem, Score, ScoringContext},
 };
@@ -37,14 +37,16 @@ impl<'a> FileItems<'a> {
 }
 
 /// Resolve a FileItem's chunked path into frizbee's pointer buffer.
-/// Returns `Some((chunk_count, byte_len))` or `None` for deleted files.
+/// Returns `Some((chunk_count, byte_len))`, or `None` for deleted files and
+/// files the character-class mask proves frizbee would reject.
 #[inline]
 fn resolve_file_chunks(
     file: &FileItem,
     arena: ArenaPtr,
+    filter: CharMaskFilter,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
-    if file.is_deleted() {
+    if file.is_deleted() || filter.rejects(file.path.char_mask()) {
         return None;
     }
     let ptrs = file.path.resolve_ptrs(arena, buf);
@@ -80,11 +82,12 @@ fn match_fuzzy_parts(
     }
 
     // Narrow two-part queries with the longer part before scoring the shorter part.
+    let filter = CharMaskFilter::new(valid_parts[first_part], &first_options);
     let first_part_matches = match_file_range(
         valid_parts[first_part],
         working_files.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_file_chunks(working_files.index(index as usize), arena, buf)
+            resolve_file_chunks(working_files.index(index as usize), arena, filter, buf)
         },
         &first_options,
         max_threads,
@@ -109,12 +112,13 @@ fn match_fuzzy_parts(
         // Match only the files that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
+        let filter = CharMaskFilter::new(part, &part_options);
         let sub_matches = match_file_range(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
                 let file = working_files.index(survivors[index as usize].index as usize);
-                resolve_file_chunks(file, arena, buf)
+                resolve_file_chunks(file, arena, filter, buf)
             },
             &part_options,
             max_threads,
@@ -356,8 +360,12 @@ fn resolve_dir_chunks(
     dir: &DirItem,
     arena: ArenaPtr,
     overflow_arena: ArenaPtr,
+    filter: CharMaskFilter,
     buf: &mut [*const u8; MAX_PATH_CHUNKS],
 ) -> Option<(usize, u16)> {
+    if filter.rejects(dir.path.char_mask()) {
+        return None;
+    }
     let arena = if dir.is_overflow() {
         overflow_arena
     } else {
@@ -387,11 +395,18 @@ fn match_fuzzy_parts_dirs(
         return vec![];
     }
 
+    let filter = CharMaskFilter::new(valid_parts[0], options);
     let first_part_matches = neo_frizbee::match_range_parallel_resolved(
         valid_parts[0],
         working_dirs.len(),
         &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
-            resolve_dir_chunks(working_dirs[index as usize], arena, overflow_arena, buf)
+            resolve_dir_chunks(
+                working_dirs[index as usize],
+                arena,
+                overflow_arena,
+                filter,
+                buf,
+            )
         },
         options,
         max_threads,
@@ -410,12 +425,13 @@ fn match_fuzzy_parts_dirs(
         // Match only the dirs that survived the previous round, addressed
         // through the previous matches without collecting a subset.
         let survivors = &matches;
+        let filter = CharMaskFilter::new(part, &part_options);
         let sub_matches = neo_frizbee::match_range_parallel_resolved(
             part,
             survivors.len(),
             &|index, buf: &mut [*const u8; MAX_PATH_CHUNKS]| {
                 let dir = working_dirs[survivors[index as usize].index as usize];
-                resolve_dir_chunks(dir, arena, overflow_arena, buf)
+                resolve_dir_chunks(dir, arena, overflow_arena, filter, buf)
             },
             &part_options,
             max_threads,
@@ -1214,6 +1230,39 @@ where
         .into_iter()
         .flatten()
         .collect()
+}
+
+// frizbee's ASCII prefilter accepts only once all but `max_typos` needle chars matched equal
+// bytes (either case), so each needle char whose class the path lacks costs one typo.
+#[derive(Clone, Copy)]
+struct CharMaskFilter {
+    needle_mask: u32,
+    max_typos: u32,
+}
+
+impl CharMaskFilter {
+    // Non-ASCII needles take frizbee's unicode path, so they disable the filter.
+    fn new(needle: &str, options: &neo_frizbee::Config) -> Self {
+        match options.max_typos {
+            Some(max_typos)
+                if needle.is_ascii() && options.matching == neo_frizbee::Matching::Fuzzy =>
+            {
+                Self {
+                    needle_mask: char_class_mask(needle.as_bytes()),
+                    max_typos: max_typos as u32,
+                }
+            }
+            _ => Self {
+                needle_mask: 0,
+                max_typos: 0,
+            },
+        }
+    }
+
+    #[inline(always)]
+    fn rejects(self, haystack_mask: u32) -> bool {
+        (self.needle_mask & !haystack_mask).count_ones() > self.max_typos
+    }
 }
 
 #[cfg(test)]
@@ -2402,5 +2451,261 @@ mod constraint_only_query_tests {
 
         assert_eq!(total_matched, 1);
         assert_eq!(items[0].relative_path(arena), "a.rs");
+    }
+}
+
+#[cfg(test)]
+mod char_mask_prefilter_tests {
+    use super::*;
+    use crate::simd_path::{
+        ChunkedPathStore, ChunkedString, build_chunked_path_store_from_strings,
+    };
+    use crate::types::PaginationArgs;
+    use fff_query_parser::QueryParser;
+
+    const SEGMENTS: &str = concat!(
+        "src lib Components third_party blink web-tests v8 api UI chrome browser views ",
+        "net base test_utils node_modules café 日本語 straße ÆØÅ x86_64 arm-neon build.gn ",
+        "Makefile README.md index.ts main.rs Cargo.toml foo_bar-baz.cc QQQ zz a Ω",
+    );
+
+    const QUERIES: &str = concat!(
+        "main|mian|MAIN|Main.rs|cargo|crago|toml|src/main|src main|main src|",
+        "chrome browser views|chorme brwoser|v8|v8 api|x86|x86_64|123|web-tests|",
+        "web_tests|foo_bar-baz.cc|foobarbaz|fbb|readme.md|README|rdme|build.gn|BUILD.gn|",
+        "bg|zz|zzz|qqq|qjxz|xyzzyq|café|cafe|日本|straße|strasse|Ω|ÆØÅ|a b|ab cd|a-b_c.d/e|",
+        "components/index.ts|cmpnts idx|third_party/blink/web-tests|",
+        "thirdpartyblinkwebtests|nodemodulesindexts|!!|@@|..|//|__|--|a1|9z|Q|qq zz|",
+        "verylongquerythatmatchesnothingatall|test_utils/main.rs|tset_utlis|ui views",
+    );
+
+    struct Fixture {
+        files: Vec<FileItem>,
+        base_count: usize,
+        base: ChunkedPathStore,
+        overflow: ChunkedPathStore,
+    }
+
+    #[test]
+    fn char_mask_filter_never_rejects_a_frizbee_match() {
+        let paths = synthetic_paths(3_000);
+        let masks: Vec<u32> = paths
+            .iter()
+            .map(|path| char_class_mask(path.as_bytes()))
+            .collect();
+        let mut rejected = 0usize;
+        for needle in QUERIES.split(['|', ' ']) {
+            for max_typos in 0..=6 {
+                for has_uppercase in [false, true] {
+                    let options = neo_frizbee::Config {
+                        max_typos: Some(max_typos),
+                        sort: neo_frizbee::SortStrategy::Unsorted,
+                        scoring: Scoring {
+                            capitalization_bonus: if has_uppercase { 8 } else { 0 },
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    let filter = CharMaskFilter::new(needle, &options);
+                    let matched = neo_frizbee::Matcher::new(needle, &options).match_list(&paths);
+                    for m in &matched {
+                        assert!(
+                            !filter.rejects(masks[m.index as usize]),
+                            "{needle:?} typos={max_typos} rejected {:?}",
+                            paths[m.index as usize]
+                        );
+                    }
+                    rejected += masks.iter().filter(|&&mask| filter.rejects(mask)).count();
+                }
+            }
+        }
+        assert!(rejected > 0, "the prefilter never fired");
+    }
+
+    #[test]
+    fn char_mask_prefilter_preserves_search_results() {
+        let paths = synthetic_paths(2_500);
+        let masked = fixture(&paths, true);
+        let unmasked = fixture(&paths, false);
+        let mut matched = 0;
+        for query in QUERIES.split('|') {
+            for max_typos in [0, 1, 2, 3, 6] {
+                for max_threads in [1, 4] {
+                    let expected = search(&unmasked, query, max_typos, max_threads);
+                    matched += expected.len();
+                    assert_eq!(
+                        search(&masked, query, max_typos, max_threads),
+                        expected,
+                        "{query:?} typos={max_typos} threads={max_threads}"
+                    );
+                }
+            }
+        }
+        assert!(matched > 0);
+    }
+
+    #[test]
+    fn char_mask_prefilter_preserves_chunked_parallel_results() {
+        let paths = synthetic_paths(40_000);
+        let masked = fixture(&paths, true);
+        let unmasked = fixture(&paths, false);
+        for query in ["mian", "chorme brwoser", "qjxz", "x86 Main", "café"] {
+            let expected = search(&unmasked, query, 2, 4);
+            assert_eq!(search(&masked, query, 2, 4), expected, "{query:?}");
+        }
+    }
+
+    #[test]
+    fn char_mask_prefilter_preserves_directory_results() {
+        let paths = synthetic_paths(2_000);
+        let mut builder = crate::simd_path::ChunkedPathStoreBuilder::new(paths.len());
+        let strings: Vec<ChunkedString> = paths
+            .iter()
+            .map(|path| builder.add_dir_immediate(path))
+            .collect();
+        let store = builder.finish();
+        let arena = store.as_arena_ptr();
+        let dirs = |masked: bool| -> Vec<DirItem> {
+            strings
+                .iter()
+                .map(|s| {
+                    let s = if masked {
+                        s.clone()
+                    } else {
+                        s.clone().without_char_mask()
+                    };
+                    DirItem::new(s, 0)
+                })
+                .collect()
+        };
+        let (masked, unmasked) = (dirs(true), dirs(false));
+        for query in QUERIES.split('|') {
+            for max_typos in [0, 2, 6] {
+                assert_eq!(
+                    search_dirs(&masked, arena, query, max_typos),
+                    search_dirs(&unmasked, arena, query, max_typos),
+                    "{query:?} typos={max_typos}"
+                );
+            }
+        }
+    }
+
+    fn synthetic_paths(count: usize) -> Vec<String> {
+        let segments: Vec<&str> = SEGMENTS.split(' ').collect();
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as usize
+        };
+        (0..count)
+            .map(|i| {
+                let mut path = String::new();
+                for _ in 0..1 + next() % 6 {
+                    path.push_str(segments[next() % segments.len()]);
+                    path.push('/');
+                }
+                path.push_str(segments[next() % segments.len()]);
+                if i % 3 == 0 {
+                    path.push_str(&format!("_{}", next() % 1000));
+                }
+                if i % 5 == 0 {
+                    path.push_str(".rs");
+                }
+                path
+            })
+            .collect()
+    }
+
+    // Splits files across a base and an overflow arena, as the watcher does.
+    fn fixture(paths: &[String], masked: bool) -> Fixture {
+        let base_count = paths.len() * 9 / 10;
+        let mut files: Vec<FileItem> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let fname = path.rfind('/').map_or(0, |p| p + 1) as u16;
+                let mut file = FileItem::new_raw(fname, 0, i as u64, None, false);
+                file.access_frecency_score = (i % 7) as i16;
+                file.set_deleted(i % 41 == 0);
+                file.set_overflow(i >= base_count);
+                file
+            })
+            .collect();
+        let (base, base_strings) =
+            build_chunked_path_store_from_strings(&paths[..base_count], &files[..base_count]);
+        let (overflow, overflow_strings) =
+            build_chunked_path_store_from_strings(&paths[base_count..], &files[base_count..]);
+        let strings = base_strings.into_iter().chain(overflow_strings);
+        for (file, string) in files.iter_mut().zip(strings) {
+            file.set_path(if masked {
+                string
+            } else {
+                string.without_char_mask()
+            });
+        }
+        Fixture {
+            files,
+            base_count,
+            base,
+            overflow,
+        }
+    }
+
+    fn search(fixture: &Fixture, query: &str, max_typos: u16, max_threads: usize) -> Vec<String> {
+        let parsed = QueryParser::default().parse(query);
+        let context = ScoringContext {
+            query: &parsed,
+            max_threads,
+            max_typos,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 0,
+            },
+        };
+        let (base, overflow) = (fixture.base.as_arena_ptr(), fixture.overflow.as_arena_ptr());
+        let (items, scores, total) = fuzzy_match_and_score_files(
+            &fixture.files,
+            &context,
+            fixture.base_count,
+            base,
+            overflow,
+        );
+        assert_eq!(items.len(), total);
+        items
+            .iter()
+            .zip(&scores)
+            .map(|(file, score)| format!("{} {score:?}", file.modified))
+            .collect()
+    }
+
+    fn search_dirs(dirs: &[DirItem], arena: ArenaPtr, query: &str, max_typos: u16) -> Vec<String> {
+        let parsed = QueryParser::default().parse(query);
+        let context = ScoringContext {
+            query: &parsed,
+            max_threads: 2,
+            max_typos,
+            current_file: None,
+            last_same_query_match: None,
+            project_path: None,
+            combo_boost_score_multiplier: 100,
+            min_combo_count: 3,
+            pagination: PaginationArgs {
+                offset: 0,
+                limit: 0,
+            },
+        };
+        let (items, scores, _) = fuzzy_match_and_score_dirs(dirs, &context, arena, arena);
+        items
+            .iter()
+            .zip(&scores)
+            .map(|(dir, score)| format!("{} {score:?}", dir.relative_path(arena)))
+            .collect()
     }
 }
