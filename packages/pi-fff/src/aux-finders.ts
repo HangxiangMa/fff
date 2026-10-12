@@ -18,6 +18,9 @@ export interface AuxOpts {
   enableHomeDirScanning?: boolean;
   followSymlinks?: boolean;
   pickers: FilePickerFactory;
+  // Returns the main (cwd) picker, or undefined if there is none. Read on every
+  // acquire: the main picker is replaced on a cwd change, so it is never cached.
+  mainPicker?: () => { root: string; finder: FileFinderApi } | undefined;
   // Called before a newly spawned aux picker starts a scan that covers $HOME.
   onHomeDirScan?: (root: string) => void;
 }
@@ -56,6 +59,15 @@ export class AuxFinderPool {
     opts?: { exact?: boolean },
   ): Promise<{ finder: FileFinderApi; root: string }> {
     this.sweepIdle();
+    // Reuse the main picker when it already indexes the requested subtree. It is
+    // not owned by this pool, so it is never added to or destroyed by this pool.
+    if (!opts?.exact) {
+      const main = this.opts.mainPicker?.();
+      if (main && !main.finder.isDestroyed && rootCovers(main.root, maybeRoot)) {
+        return { finder: main.finder, root: main.root };
+      }
+    }
+
     let covering: AuxPicker | null = null;
     for (const e of this.entries) {
       if (e.finder.isDestroyed) continue;

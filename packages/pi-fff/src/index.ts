@@ -464,6 +464,9 @@ export default function fffExtension(pi: ExtensionAPI) {
       followSymlinks,
       onHomeDirScan: warnHomeDirScan,
       pickers,
+      // Read live: ensureFinder replaces mainFinder when the cwd changes.
+      mainPicker: () =>
+        mainFinder && finderCwd ? { root: finderCwd, finder: mainFinder } : undefined,
     });
   }
 

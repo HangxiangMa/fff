@@ -1,4 +1,5 @@
 import { describe, expect, mock, test } from "bun:test";
+import type { FileFinderApi } from "@ff-labs/fff-node";
 import os from "node:os";
 import path from "node:path";
 
@@ -99,6 +100,42 @@ describe("AuxFinderPool covering reuse", () => {
     await pool.acquire("/a/b/c");
 
     expect(createOptions[0]?.disableWatch).toBe(true);
+  });
+
+  test("reuses the main picker when it covers the requested path", async () => {
+    // The main picker already indexes the cwd subtree. A second aux scan of the
+    // same subtree duplicates the scan and the index, so reuse the main one.
+    // The mock is partial, so widen it explicitly to the finder type the pool expects.
+    const main = { root: "/a/b", finder: createMockFinder("/a/b") as unknown as FileFinderApi };
+    // makePool clears the counters, so `created` only counts pickers made by the pool.
+    const pool = makePool({ mainPicker: () => main });
+    const a = await pool.acquire("/a/b/c");
+
+    expect(a.finder).toBe(main.finder);
+    expect(a.root).toBe("/a/b");
+    expect(created.length).toBe(0);
+    expect(createOptions.length).toBe(0);
+  });
+
+  test("does not reuse the main picker for an exact request", async () => {
+    const main = { root: "/a/b", finder: createMockFinder("/a/b") };
+    const pool = makePool({ mainPicker: () => main });
+    const a = await pool.acquire("/a/b/c", { exact: true });
+
+    expect(a.finder).not.toBe(main.finder);
+    expect(a.root).toBe("/a/b/c");
+  });
+
+  test("never returns a destroyed main picker", async () => {
+    // The main picker can be replaced on a cwd change. A destroyed one must
+    // not be handed out, so aux creates its own picker instead.
+    const main = { root: "/a/b", finder: createMockFinder("/a/b") };
+    main.finder.destroy();
+    const pool = makePool({ mainPicker: () => main });
+    const a = await pool.acquire("/a/b/c");
+
+    expect(a.finder).not.toBe(main.finder);
+    expect(a.root).toBe("/a/b/c");
   });
 
   test("does not reuse a picker rooted deeper than the requested path", async () => {
