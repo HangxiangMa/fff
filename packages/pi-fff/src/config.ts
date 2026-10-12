@@ -16,6 +16,12 @@ export interface FffConfig {
   enableHomeDirScanning?: boolean;
   warnOnHomeDirScan?: boolean;
   followSymlinks?: boolean;
+  /**
+   * Directory count above which the cwd picker runs without its background
+   * watcher. The index then stops tracking file changes. 0 keeps the watcher on
+   * for every root.
+   */
+  maxWatchedDirs?: number;
 }
 
 const CONFIG_KEYS = new Set<keyof FffConfig>([
@@ -27,6 +33,7 @@ const CONFIG_KEYS = new Set<keyof FffConfig>([
   "enableHomeDirScanning",
   "warnOnHomeDirScan",
   "followSymlinks",
+  "maxWatchedDirs",
 ]);
 
 export function loadConfig(agentDir = piDataDir()): FffConfig {
@@ -70,6 +77,7 @@ export function loadConfig(agentDir = piDataDir()): FffConfig {
   validateBoolean(configPath, parsed, "enableHomeDirScanning");
   validateBoolean(configPath, parsed, "warnOnHomeDirScan");
   validateBoolean(configPath, parsed, "followSymlinks");
+  validateNonNegativeInteger(configPath, parsed, "maxWatchedDirs");
 
   return parsed as FffConfig;
 }
@@ -94,6 +102,17 @@ function validateString(
   const value = config[key];
   if (value !== undefined && (typeof value !== "string" || value.length === 0)) {
     throw invalidConfig(configPath, `"${key}" must be a non-empty string`);
+  }
+}
+
+function validateNonNegativeInteger(
+  configPath: string,
+  config: Record<string, unknown>,
+  key: "maxWatchedDirs",
+): void {
+  const value = config[key];
+  if (value !== undefined && (!Number.isInteger(value) || (value as number) < 0)) {
+    throw invalidConfig(configPath, `"${key}" must be a non-negative integer`);
   }
 }
 

@@ -33,6 +33,7 @@ import { type FffMode, loadConfig, VALID_MODES } from "./config";
 import { FilePickerFactory } from "./file-picker";
 import { isFsRoot, isHomeDir, resolveDbPaths } from "./paths";
 import { buildQuery } from "./query";
+import { exceedsWatchBudget } from "./watch-budget";
 
 export { SCAN_TIMEOUT_MS } from "./sdk";
 
@@ -435,6 +436,13 @@ export default function fffExtension(pi: ExtensionAPI) {
   } | null = null;
   let homeScanTimer: ReturnType<typeof setInterval> | null = null;
 
+  function warnWatchDisabled(root: string, limit: number): void {
+    uiCtx?.ui.notify(
+      `fff: ${root} has more than ${limit} directories, so its file watcher is off. Search results will not reflect file changes made after this picker was created. Raise "maxWatchedDirs" in pi-fff.json to change this.`,
+      "warning",
+    );
+  }
+
   function warnHomeDirScan(root: string): void {
     if (!warnOnHomeDirScan) return;
     uiCtx?.ui.notify(
@@ -501,11 +509,19 @@ export default function fffExtension(pi: ExtensionAPI) {
       // if the dbs can't be opened the factory falls back to a db-less picker,
       // e.g. when some other process corrupts the lock
       if (!pickers) throw new Error("FFF picker factory is not initialized");
+      // A root with too many directories would register one inotify watch per
+      // directory. Past the configured budget the picker keeps its index but
+      // stops tracking file changes. fff cannot turn the watcher off after
+      // creation, so the decision must be made here, before the picker exists.
+      const watchBudgetExceeded = exceedsWatchBudget(cwd, config.maxWatchedDirs ?? 0);
+      if (watchBudgetExceeded) warnWatchDisabled(cwd, config.maxWatchedDirs ?? 0);
       mainFinder = await pickers.create({
         basePath: cwd,
         enableHomeDirScanning,
         enableFsRootScanning,
         followSymlinks,
+        // Only set when the budget is exceeded, so the default call shape is unchanged.
+        ...(watchBudgetExceeded ? { disableWatch: true } : {}),
       });
       finderCwd = cwd;
       return mainFinder;

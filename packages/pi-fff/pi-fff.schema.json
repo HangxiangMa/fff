@@ -46,6 +46,12 @@
       "type": "boolean",
       "default": true,
       "description": "Indexes through directory symlinks, e.g. a git worktree or stow layout whose files live behind links. Set to false to keep the walk inside the real tree."
+    },
+    "maxWatchedDirs": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 0,
+      "description": "Directory count above which the cwd picker runs without its background watcher. Search results then stop reflecting file changes made after the picker was created. 0 keeps the watcher on for every root."
     }
   }
 }

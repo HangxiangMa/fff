@@ -33,6 +33,7 @@ describe("loadConfig", () => {
       enableHomeDirScanning: false,
       warnOnHomeDirScan: false,
       followSymlinks: true,
+      maxWatchedDirs: 50000,
     };
     writeConfig(config);
 
@@ -70,6 +71,9 @@ describe("loadConfig", () => {
       [{ enableHomeDirScanning: "false" }, '"enableHomeDirScanning" must be a boolean'],
       [{ warnOnHomeDirScan: "false" }, '"warnOnHomeDirScan" must be a boolean'],
       [{ followSymlinks: "true" }, '"followSymlinks" must be a boolean'],
+      [{ maxWatchedDirs: -1 }, '"maxWatchedDirs" must be a non-negative integer'],
+      [{ maxWatchedDirs: 1.5 }, '"maxWatchedDirs" must be a non-negative integer'],
+      [{ maxWatchedDirs: "100" }, '"maxWatchedDirs" must be a non-negative integer'],
     ];
 
     for (const [config, message] of cases) {

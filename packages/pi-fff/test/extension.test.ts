@@ -332,6 +332,36 @@ describe("pi-fff global config", () => {
 
   // #627: worktree and stow layouts reach their files through symlinks, so following
   // them is the default and the environment is the way out.
+  test("runs the cwd picker without a watcher when it exceeds maxWatchedDirs", async () => {
+    // A real tree of 6 directories, so the budget check reads actual files.
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fff-budget-ext-"));
+    try {
+      for (let i = 0; i < 6; i++) fs.mkdirSync(path.join(cwd, `d${i}`));
+      writeConfig({ maxWatchedDirs: 5 });
+
+      await start(undefined, cwd);
+
+      expect(createCalls[0]).toMatchObject({ basePath: cwd, disableWatch: true });
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps the watcher on when the tree is within maxWatchedDirs", async () => {
+    const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-fff-budget-ext-"));
+    try {
+      for (let i = 0; i < 6; i++) fs.mkdirSync(path.join(cwd, `d${i}`));
+      writeConfig({ maxWatchedDirs: 6 });
+
+      await start(undefined, cwd);
+
+      // Default call shape: no disableWatch key at all.
+      expect(createCalls[0]).not.toHaveProperty("disableWatch");
+    } finally {
+      fs.rmSync(cwd, { recursive: true, force: true });
+    }
+  });
+
   test("stops following symlinks when the environment disables them", async () => {
     process.env.FFF_FOLLOW_SYMLINKS = "0";
 
