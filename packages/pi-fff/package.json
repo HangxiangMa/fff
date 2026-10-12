@@ -41,8 +41,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ff-labs/fff-bun": "*",
-    "@ff-labs/fff-node": "*"
+    "@ff-labs/fff-bun": "0.11.1-nightly.d978416",
+    "@ff-labs/fff-node": "0.11.1-nightly.d978416"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
