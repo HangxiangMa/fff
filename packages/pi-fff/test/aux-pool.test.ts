@@ -91,6 +91,16 @@ describe("AuxFinderPool covering reuse", () => {
     expect(createOptions[0]?.followSymlinks).toBe(true);
   });
 
+  test("disables the background watcher on aux pickers", async () => {
+    // Aux pickers only answer searches and never subscribe to watch events.
+    // A background watcher registers one inotify watch per indexed directory,
+    // so keeping it on duplicates every covered subtree of the main picker.
+    const pool = makePool();
+    await pool.acquire("/a/b/c");
+
+    expect(createOptions[0]?.disableWatch).toBe(true);
+  });
+
   test("does not reuse a picker rooted deeper than the requested path", async () => {
     const pool = makePool();
     await pool.acquire("/a/b/c");

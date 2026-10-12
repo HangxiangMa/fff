@@ -6,6 +6,8 @@ export interface PickerOptions {
   enableHomeDirScanning?: boolean;
   enableFsRootScanning?: boolean;
   followSymlinks?: boolean;
+  /** Skip the background watcher. It registers one inotify watch per indexed directory. */
+  disableWatch?: boolean;
 }
 
 /** Opens every picker in this pi process — the cwd picker and the aux pickers —

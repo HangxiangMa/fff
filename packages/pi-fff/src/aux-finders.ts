@@ -106,6 +106,9 @@ export class AuxFinderPool {
       enableHomeDirScanning,
       enableFsRootScanning: this.opts.enableFsRootScanning,
       followSymlinks: this.opts.followSymlinks,
+      // Aux pickers only answer searches. Their watchers would duplicate the
+      // inotify watches already held by the main picker for the same subtree.
+      disableWatch: true,
     });
 
     const entry: AuxPicker = { root, finder, lastUsed: Date.now() };
